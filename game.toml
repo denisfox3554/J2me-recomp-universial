@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# game.toml — J2ME Recomp game configuration
+# Similar to PS2Recomp's TOML config + N64Recomp's symbol TOML
+# ─────────────────────────────────────────────────────────────────────────────
+
+[game]
+name        = "MyGame"           # Executable name / CMake target
+jar         = "game.jar"         # Input JAR path (relative to this file)
+main_class  = "com/example/Main" # Entry point (slash-separated, no .class)
+output_dir  = "game_src"         # Where recomp writes generated C++ (optional)
+
+# ── Patches ──────────────────────────────────────────────────────────────────
+# Patch individual bytecode instructions before recompilation.
+# type = "replace_call" : replace a virtual call with a stub symbol
+# type = "skip_method"  : emit empty body for this method
+# type = "nop"          : replace a single bytecode offset with NOP
+
+[[patches]]
+class  = "com/example/GameCanvas"
+method = "repaint"
+type   = "replace_call"
+symbol = "j2me_repaint_stub"
+
+[[patches]]
+class  = "com/example/SoundManager"
+method = "playSound"
+type   = "skip_method"
+
+# ── Stubs ─────────────────────────────────────────────────────────────────────
+# Methods resolved at link time against the runtime (libj2mert).
+# Similar to PS2Recomp general.stubs.
+
+[[stubs]]
+class  = "javax/microedition/lcdui/Display"
+method = "getDisplay"
+
+[[stubs]]
+class  = "javax/microedition/media/Manager"
+method = "createPlayer"
+
+# ── Symbol overrides ──────────────────────────────────────────────────────────
+# Force a specific C symbol name for a class method (useful for hand-written
+# replacements, analogous to N64Recomp symbol metadata).
+
+[[symbols]]
+class   = "com/example/Main"
+method  = "<init>"
+symbol  = "game_main_init"
+
+# ── Compile flags ─────────────────────────────────────────────────────────────
+[build]
+extra_cxx_flags = ["-O2", "-DGAME_TITLE=\"MyGame\""]
+link_libraries  = ["SDL2", "SDL2_mixer"]   # appended to target_link_libraries
