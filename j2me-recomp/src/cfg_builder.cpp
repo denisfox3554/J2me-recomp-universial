@@ -3,6 +3,7 @@
 #include <cassert>
 #include <iostream>
 #include <functional>
+#include <climits>
 #include <stack>
 #include <queue>
 
@@ -16,7 +17,7 @@
 std::unordered_set<int> CFGBuilder::find_leaders(const IRMethod& m) {
     std::unordered_set<int> leaders;
     if (m.instrs.empty()) return leaders;
-    leaders.insert(0);  // entry
+    leaders.insert(m.instrs[0].bc_off);  // entry = first instruction's bc_off
 
     for (int i = 0; i < (int)m.instrs.size(); ++i) {
         const IRInstr& ins = m.instrs[i];
@@ -28,8 +29,11 @@ std::unordered_set<int> CFGBuilder::find_leaders(const IRMethod& m) {
                           ins.op == IROp::ReturnValue ||
                           ins.op == IROp::Throw);
         if (is_branch) {
+            // Branch targets are already bc_off values
             for (int t : ins.targets) leaders.insert(t);
-            if (i+1 < (int)m.instrs.size()) leaders.insert(i+1);
+            // Instruction after branch
+            if (i+1 < (int)m.instrs.size())
+                leaders.insert(m.instrs[i+1].bc_off);
         }
     }
     return leaders;
@@ -41,24 +45,43 @@ std::unordered_set<int> CFGBuilder::find_leaders(const IRMethod& m) {
 void CFGBuilder::build_blocks(CFG& cfg, IRMethod& m,
                                const std::unordered_set<int>& leaders)
 {
-    // Sort leader instruction indices
+    // leaders contains bc_off values.
+    // Build a map: bc_off → instruction index
+    std::unordered_map<int,int> bcoff_to_instr;
+    for (int i = 0; i < (int)m.instrs.size(); ++i)
+        bcoff_to_instr[m.instrs[i].bc_off] = i;
+
+    // Sort leader bc_offs
     std::vector<int> sorted_leaders(leaders.begin(), leaders.end());
     std::sort(sorted_leaders.begin(), sorted_leaders.end());
 
     cfg.blocks.clear();
     offset_to_block_.clear();
 
-    // Create blocks (one per leader range)
+    // For each leader range, find the instruction indices that belong to it
     for (int i = 0; i < (int)sorted_leaders.size(); ++i) {
+        int leader_off = sorted_leaders[i];
+        int next_off   = (i+1 < (int)sorted_leaders.size())
+                         ? sorted_leaders[i+1]
+                         : INT_MAX;
+
+        // Find start instruction index for this leader
+        auto it = bcoff_to_instr.find(leader_off);
+        if (it == bcoff_to_instr.end()) continue; // leader has no instruction
+
         BasicBlock bb;
         bb.id       = (int)cfg.blocks.size();
-        bb.bc_start = sorted_leaders[i];
-        bb.bc_end   = (i+1 < (int)sorted_leaders.size())
-                      ? sorted_leaders[i+1]
-                      : (int)m.instrs.size();
-        for (int j = bb.bc_start; j < bb.bc_end; ++j)
+        bb.bc_start = leader_off;
+        bb.bc_end   = next_off;
+
+        // Collect all instructions whose bc_off is in [leader_off, next_off)
+        int start_idx = it->second;
+        for (int j = start_idx; j < (int)m.instrs.size(); ++j) {
+            if (m.instrs[j].bc_off >= next_off) break;
             bb.instr_indices.push_back(j);
-        offset_to_block_[bb.bc_start] = bb.id;
+        }
+
+        offset_to_block_[leader_off] = bb.id;
         cfg.blocks.push_back(std::move(bb));
     }
 
@@ -68,9 +91,12 @@ void CFGBuilder::build_blocks(CFG& cfg, IRMethod& m,
         const IRInstr& last = m.instrs[bb.instr_indices.back()];
 
         auto add_edge = [&](int src, int dst_off) {
-            auto it = offset_to_block_.find(dst_off);
-            if (it == offset_to_block_.end()) return;
-            int dst = it->second;
+            auto it2 = offset_to_block_.find(dst_off);
+            if (it2 == offset_to_block_.end()) return;
+            int dst = it2->second;
+            // Avoid duplicate edges
+            for (int s : cfg.blocks[src].succs)
+                if (s == dst) return;
             cfg.blocks[src].succs.push_back(dst);
             cfg.blocks[dst].preds.push_back(src);
         };
@@ -79,20 +105,22 @@ void CFGBuilder::build_blocks(CFG& cfg, IRMethod& m,
             case IROp::Return:
             case IROp::ReturnValue:
             case IROp::Throw:
-                break; // no successors
+                break;
             case IROp::Goto:
-                add_edge(bb.id, last.targets[0]);
+                if (!last.targets.empty()) add_edge(bb.id, last.targets[0]);
                 break;
             case IROp::If:
-                add_edge(bb.id, last.targets[0]); // taken
-                add_edge(bb.id, last.targets[1]); // fall-through
+                if (last.targets.size() >= 2) {
+                    add_edge(bb.id, last.targets[0]);
+                    add_edge(bb.id, last.targets[1]);
+                }
                 break;
             case IROp::TableSwitch:
             case IROp::LookupSwitch:
                 for (int t : last.targets) add_edge(bb.id, t);
                 break;
             default:
-                // Fall-through to next block
+                // Fall-through: find the block that starts right after this one
                 if (bb.id + 1 < cfg.num_blocks())
                     add_edge(bb.id, bb.id + 1);
                 break;
@@ -252,11 +280,15 @@ CFG CFGBuilder::build(IRMethod& m) {
     }
 
     auto leaders = find_leaders(m);
+
     build_blocks(cfg, m, leaders);
+
     compute_dominators(cfg);
+
     compute_dom_frontiers(cfg);
+
     insert_phis(cfg, m);
-    // RPO already computed by compute_dominators
+
     return cfg;
 }
 

@@ -45,24 +45,36 @@ std::string CppEmitter::params_from_desc(const std::string& desc,
                                           bool is_static,
                                           const std::string& class_name) {
     std::string result;
-    if (!is_static) {
-        result += "jref p_this";
-    }
-    size_t i = 1; // skip '('
-    int    pn = 0;
+    if (!is_static) result += "jref p_this";
+
+    if (desc.empty() || desc[0] != '(') return result;
+
+    size_t i = 1;
+    int pn = 0;
     while (i < desc.size() && desc[i] != ')') {
         if (!result.empty()) result += ", ";
         char c = desc[i];
         std::string t;
         if (c == 'L') {
-            t = "jref"; while (i < desc.size() && desc[i] != ';') ++i; ++i;
+            t = "jref";
+            ++i;
+            while (i < desc.size() && desc[i] != ';') ++i;
+            if (i < desc.size()) ++i; // skip ';'
         } else if (c == '[') {
-            t = "jref"; while (i < desc.size() && desc[i] == '[') ++i;
-            if (i < desc.size() && desc[i] == 'L') { while (i < desc.size() && desc[i] != ';') ++i; ++i; }
-            else ++i;
+            t = "jref";
+            while (i < desc.size() && desc[i] == '[') ++i;
+            if (i < desc.size() && desc[i] == 'L') {
+                while (i < desc.size() && desc[i] != ';') ++i;
+                if (i < desc.size()) ++i;
+            } else if (i < desc.size()) {
+                ++i;
+            }
+        } else if (c == 'J' || c == 'D') {
+            t = (c == 'J') ? "jlong" : "jdouble";
+            ++i;
         } else {
-            t = cpp_type_from_desc(c); ++i;
-            if (c == 'J' || c == 'D') { /* wide — already advanced */ }
+            t = cpp_type_from_desc(c);
+            ++i;
         }
         result += t + " p" + std::to_string(pn++);
     }
@@ -502,6 +514,10 @@ void CppEmitter::emit_method(std::ostream& out, const IRMethod& m) {
     // Work on a mutable copy — CFGBuilder and SSABuilder modify it
     IRMethod mm = m;
 
+    std::cerr << "    [emit_method] " << m.method_name
+              << " instrs=" << m.instrs.size() << "\n";
+
+
     // Build CFG
     CFGBuilder cfg_builder;
     CFG cfg;
@@ -514,6 +530,7 @@ void CppEmitter::emit_method(std::ostream& out, const IRMethod& m) {
         return;
     }
 
+
     // SSA renaming
     try {
         SSABuilder ssa;
@@ -521,6 +538,7 @@ void CppEmitter::emit_method(std::ostream& out, const IRMethod& m) {
     } catch (...) {
         // SSA failure is non-fatal — emit without SSA
     }
+
 
     // Build value name map
     std::unordered_map<int,std::string> vn;
@@ -545,9 +563,17 @@ void CppEmitter::emit_method(std::ostream& out, const IRMethod& m) {
         }
     }
 
+
     // Signature
-    emit_method_signature(out, mm, true);
+    try {
+        emit_method_signature(out, mm, true);
+    } catch (...) {
+        out << "void " << mangle(mm.class_name, mm.method_name, mm.descriptor) << "_stub() {}\n\n";
+        std::cerr << "      [signature crash — stub emitted]\n";
+        return;
+    }
     out << "{\n";
+
 
     // Declare locals
     int param_slot = 0;
@@ -577,12 +603,19 @@ void CppEmitter::emit_method(std::ostream& out, const IRMethod& m) {
         if (bid < 0 || bid >= cfg.num_blocks()) continue;
         const BasicBlock& bb = cfg.block(bid);
 
+        std::cerr << "        [block] " << bid
+                  << " instrs=" << bb.instr_indices.size() << "\n";
+
         out << "    " << block_label(bb.id) << ":;\n";
 
         for (int idx : bb.instr_indices) {
             // Bounds check — critical
             if (idx < 0 || idx >= (int)mm.instrs.size()) continue;
             const IRInstr& ins = mm.instrs[idx];
+
+            std::cerr << "          [ins] op=" << (int)ins.op
+                      << " dst=" << ins.dst
+                      << " srcs=" << ins.srcs.size() << "\n";
 
             bool is_term = (ins.op == IROp::Goto   || ins.op == IROp::If     ||
                             ins.op == IROp::Return  || ins.op == IROp::ReturnValue ||
@@ -607,12 +640,6 @@ void CppEmitter::emit_method(std::ostream& out, const IRMethod& m) {
                     }
                 }
             }
-            // Log before emit so crash shows which op failed
-            std::cerr << "      [instr] op=" << (int)ins.op
-                      << " dst=" << ins.dst
-                      << " srcs=" << ins.srcs.size()
-                      << " bc=" << ins.bc_off << "\n";
-            std::cerr.flush();
             emit_instr(out, ins, vn, 1);
         }
 
@@ -660,6 +687,8 @@ bool CppEmitter::emit(const std::string& out_path) {
 
     // Method bodies
     for (auto& m : methods_) {
+        f << "// method: " << m.method_name << "\n";
+        f.flush();
         emit_method(f, m);
     }
 
